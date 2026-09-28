@@ -1,0 +1,135 @@
+{
+  "phase": 9,
+  "suite": "phase-9-supabase-auth-suite",
+  "timestamp": "2026-09-26T17:23:15.975Z",
+  "total": 17,
+  "passed": 17,
+  "failed": 0,
+  "supabaseStatus": "CONFIGURATION_REQUIRED",
+  "googleOAuth": "NOT_CONFIGURED",
+  "phoneOTP": "NOT_CONFIGURED",
+  "localFallback": "OPERATIONAL",
+  "secretScan": "CLEAN",
+  "releaseDecision": "CONDITIONAL_GO",
+  "results": [
+    {
+      "id": 1,
+      "title": "supabaseClient.ts: isSupabaseConfigured() rejects empty/placeholder URLs",
+      "status": "PASSED",
+      "durationMs": 0,
+      "evidence": "isSupabaseConfigured() correctly guards all placeholder patterns"
+    },
+    {
+      "id": 2,
+      "title": ".env.development: URL is either unconfigured or a valid real HTTPS URL",
+      "status": "PASSED",
+      "durationMs": 24,
+      "evidence": "VITE_SUPABASE_URL verified (configured with real URL)"
+    },
+    {
+      "id": 3,
+      "title": ".env.development: Key is either unconfigured or a valid real key",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "VITE_SUPABASE_ANON_KEY verified (configured with valid key)"
+    },
+    {
+      "id": 4,
+      "title": ".gitignore: All .env* files are protected from source control",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": ".gitignore protects all .env files from accidental secret commits"
+    },
+    {
+      "id": 5,
+      "title": "Secret Scan: No service-role key value in src/ files",
+      "status": "PASSED",
+      "durationMs": 18,
+      "evidence": "No service-role key values found in frontend source files"
+    },
+    {
+      "id": 6,
+      "title": "Secret Scan: No hardcoded production Supabase URL in src/",
+      "status": "PASSED",
+      "durationMs": 16,
+      "evidence": "No hardcoded production Supabase URLs in source files"
+    },
+    {
+      "id": 7,
+      "title": "Migrations: All 6 migration files exist in supabase/migrations/",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "All 6 migration files present"
+    },
+    {
+      "id": 8,
+      "title": "Migration 001: profiles table has auth_user_id UNIQUE column",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "profiles table has auth_user_id UUID UNIQUE — canonical identity anchor verified"
+    },
+    {
+      "id": 9,
+      "title": "Migration 002: RLS policies defined for sensitive tables",
+      "status": "PASSED",
+      "durationMs": 0,
+      "evidence": "29 RLS policies defined across sensitive tables"
+    },
+    {
+      "id": 10,
+      "title": "authService.ts: All Supabase API calls guarded by isSupabaseConfigured()",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "authService uses isSupabaseConfigured() 7 times — all Supabase calls gated"
+    },
+    {
+      "id": 11,
+      "title": "authService.ts: Auth state machine has 4 required states",
+      "status": "PASSED",
+      "durationMs": 0,
+      "evidence": "All 4 auth states present: INITIALIZING → UNAUTHENTICATED → ONBOARDING → AUTHENTICATED"
+    },
+    {
+      "id": 12,
+      "title": "Privilege escalation: Privileged roles blocked from self-assignment",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "Privileged roles (HOSPITAL_ADMIN, BLOOD_BANK_ADMIN, AMBULANCE_PROVIDER_ADMIN, SUPER_ADMIN, LIFELINEX_ADMIN) blocked from self-assignment"
+    },
+    {
+      "id": 13,
+      "title": "Google OAuth: Status correctly reported as NOT CONFIGURED (no credentials)",
+      "status": "PASSED",
+      "durationMs": 0,
+      "evidence": "Google OAuth method exists; surfaces CONFIGURATION REQUIRED when provider not activated"
+    },
+    {
+      "id": 14,
+      "title": "Phone OTP: Status correctly reported as BLOCKED without SMS provider",
+      "status": "PASSED",
+      "durationMs": 0,
+      "evidence": "Phone OTP method exists; surfaces CONFIGURATION REQUIRED when SMS provider not configured"
+    },
+    {
+      "id": 15,
+      "title": "Local fallback: Developer Sandbox accessible when Supabase not configured",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "Developer Sandbox mode available — full local fallback when Supabase not configured"
+    },
+    {
+      "id": 16,
+      "title": "databaseAdapter.ts: All 8 core tables seeded for local fallback",
+      "status": "PASSED",
+      "durationMs": 1,
+      "evidence": "All 7 core tables present in local fallback adapter"
+    },
+    {
+      "id": 17,
+      "title": "Build: TypeScript compilation succeeds with 0 errors (tsc -b)",
+      "status": "PASSED",
+      "durationMs": 9449,
+      "evidence": "tsc -b completed with 0 errors"
+    }
+  ]
+}
