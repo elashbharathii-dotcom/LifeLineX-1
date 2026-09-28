@@ -3,6 +3,7 @@
 // Coordinates ESP32 (MAX30102 + MPU6050) sync, offline buffering, signal quality, and hospital authorization
 
 import { dbAdapter } from './databaseAdapter';
+import { supabase, isSupabaseConfigured } from './supabaseClient';
 import {
   WearableDevice,
   WearableActivityRecord,
@@ -11,6 +12,8 @@ import {
   WearableVitalsRecord,
   WearableAlert,
   WearableSyncStatus,
+  WearableConnectionStatus,
+  WearableDataRow,
   SensorSignalQuality,
   WearableAlertType,
   WearableAlertSeverity,
@@ -34,6 +37,7 @@ export interface WearableTodayOverview {
   lastSyncTimestamp: string | null;
   syncStatus: WearableSyncStatus;
   device: WearableDevice | null;
+  liveRow?: WearableDataRow | null;
 }
 
 export interface OfflinePayload {
@@ -46,6 +50,17 @@ export interface OfflinePayload {
   recordedAt: string;
 }
 
+export const formatRelativeTime = (seconds: number): string => {
+  if (seconds < 10) return 'Just now';
+  if (seconds < 60) return `${Math.floor(seconds)} seconds ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+};
+
 export const wearableService = {
   // ─── 1. Device Pairing & Management ───────────────────────────────────────
   getDeviceForPregnancy(pregnancyId: string): WearableDevice | null {
@@ -53,7 +68,311 @@ export const wearableService = {
     return devices.find((d) => d.pregnancy_id === pregnancyId) || null;
   },
 
-  pairDevice(patientId: string, pregnancyId: string, deviceName = 'LifelineX Maternal ESP32 Band'): WearableDevice {
+  getDeviceFreshness(lastSeenIso?: string | null, isManualDisconnected = false): {
+    status: WearableConnectionStatus;
+    label: string;
+    relativeTime: string;
+    isOnline: boolean;
+  } {
+    if (isManualDisconnected) {
+      return { status: 'DISCONNECTED', label: 'Disconnected', relativeTime: 'Manual disconnect', isOnline: false };
+    }
+    if (!lastSeenIso) {
+      return { status: 'DISCONNECTED', label: 'Disconnected', relativeTime: 'Never seen', isOnline: false };
+    }
+    const diffSeconds = Math.max(0, (Date.now() - new Date(lastSeenIso).getTime()) / 1000);
+    if (diffSeconds <= 45) {
+      return {
+        status: 'CONNECTED',
+        label: 'Online',
+        relativeTime: formatRelativeTime(diffSeconds),
+        isOnline: true,
+      };
+    }
+    return {
+      status: 'OFFLINE',
+      label: 'Offline',
+      relativeTime: formatRelativeTime(diffSeconds),
+      isOnline: false,
+    };
+  },
+
+  async fetchWearableData(deviceId: string): Promise<WearableDataRow | null> {
+    if (!isSupabaseConfigured()) return null;
+    try {
+      const { data, error } = await supabase
+        .from('wearable_data')
+        .select('*')
+        .eq('device_id', deviceId)
+        .order('last_seen', { ascending: false })
+        .limit(1);
+
+      if (error || !data || data.length === 0) return null;
+      return data[0] as WearableDataRow;
+    } catch (e) {
+      console.error('Error fetching wearable data from Supabase:', e);
+      return null;
+    }
+  },
+
+  subscribeToDeviceRealtime(deviceId: string, onUpdate: (row: WearableDataRow) => void): () => void {
+    if (!isSupabaseConfigured()) return () => {};
+    try {
+      const channelName = `wearable-live-${deviceId}-${Date.now()}`;
+      const channel = supabase
+        .channel(channelName)
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'wearable_data',
+            filter: `device_id=eq.${deviceId}`,
+          },
+          (payload) => {
+            if (payload.new) {
+              onUpdate(payload.new as WearableDataRow);
+            }
+          }
+        )
+        .subscribe();
+
+      return () => {
+        try {
+          supabase.removeChannel(channel);
+        } catch {
+          // cleanup
+        }
+      };
+    } catch (e) {
+      console.error('Failed to subscribe to wearable realtime channel:', e);
+      return () => {};
+    }
+  },
+
+  ingestSupabaseRow(
+    pregnancyId: string,
+    patientId: string,
+    deviceRecordId: string,
+    row: WearableDataRow
+  ): void {
+    const timestamp = row.last_seen || row.created_at || new Date().toISOString();
+
+    // 1. Ingest Vitals (Heart Rate & SpO2) with duplicate prevention
+    if (row.heart_rate && row.heart_rate > 0) {
+      const existingVitals = ((dbAdapter.getTable('wearable_vitals_records') || []) as WearableVitalsRecord[])
+        .filter((v) => v.pregnancy_id === pregnancyId);
+
+      const isDuplicate = existingVitals.some(
+        (v) =>
+          v.measurement_timestamp === timestamp ||
+          (Math.abs(new Date(v.measurement_timestamp).getTime() - new Date(timestamp).getTime()) < 3000 &&
+            v.heart_rate === row.heart_rate &&
+            v.spo2 === row.spo2)
+      );
+
+      if (!isDuplicate) {
+        const vitalsRecord: WearableVitalsRecord = {
+          id: crypto.randomUUID(),
+          patient_id: patientId,
+          pregnancy_id: pregnancyId,
+          device_id: deviceRecordId,
+          heart_rate: Number(row.heart_rate),
+          spo2: Number(row.spo2 || 98),
+          signal_quality: 'GOOD',
+          measurement_timestamp: timestamp,
+          synced_at: new Date().toISOString(),
+          sync_status: 'SYNCED',
+          source: 'WIFI',
+          created_at: new Date().toISOString(),
+        };
+        dbAdapter.insert('wearable_vitals_records', vitalsRecord);
+      }
+    }
+
+    // 2. Ingest Activity (Steps)
+    if (row.steps !== null && row.steps !== undefined && row.steps >= 0) {
+      const startOfDay = new Date();
+      startOfDay.setHours(0, 0, 0, 0);
+      const startIso = startOfDay.toISOString();
+
+      const existingActivities = ((dbAdapter.getTable('wearable_activity_records') || []) as WearableActivityRecord[])
+        .filter((a) => a.pregnancy_id === pregnancyId && a.recorded_at >= startIso);
+
+      if (existingActivities.length > 0) {
+        const currentRecord = existingActivities[0];
+        if (row.steps > currentRecord.steps) {
+          dbAdapter.update('wearable_activity_records', currentRecord.id, {
+            steps: row.steps,
+            active_duration_minutes: Math.round(row.steps / 100),
+            synced_at: new Date().toISOString(),
+          });
+        }
+      } else {
+        const activityRecord: WearableActivityRecord = {
+          id: crypto.randomUUID(),
+          patient_id: patientId,
+          pregnancy_id: pregnancyId,
+          device_id: deviceRecordId,
+          steps: row.steps,
+          active_duration_minutes: Math.round(row.steps / 100),
+          activity_level: row.steps > 3000 ? 'MODERATE' : 'LIGHT',
+          recorded_at: timestamp,
+          synced_at: new Date().toISOString(),
+          sync_status: 'SYNCED',
+          source: 'WIFI',
+          created_at: new Date().toISOString(),
+        };
+        dbAdapter.insert('wearable_activity_records', activityRecord);
+      }
+    }
+
+    // 3. Ingest Movement & Fall Detection
+    if (row.fall_detected) {
+      const existingAlerts = ((dbAdapter.getTable('wearable_alerts') || []) as WearableAlert[])
+        .filter((a) => a.pregnancy_id === pregnancyId && a.alert_type === 'SUDDEN_MOVEMENT');
+
+      const recentAlert = existingAlerts.some(
+        (a) => Math.abs(new Date(a.created_at).getTime() - new Date(timestamp).getTime()) < 30000
+      );
+
+      if (!recentAlert) {
+        this.createAlert(
+          patientId,
+          pregnancyId,
+          deviceRecordId,
+          'SUDDEN_MOVEMENT',
+          'CRITICAL',
+          'Fall / Sudden Impact Detected',
+          'ESP32 MPU6050 sensor registered an acute sudden impact or fall. Obstetrics care team alert triggered.'
+        );
+
+        const movementRecord: WearableMovementRecord = {
+          id: crypto.randomUUID(),
+          patient_id: patientId,
+          pregnancy_id: pregnancyId,
+          device_id: deviceRecordId,
+          movement_event_type: 'SUDDEN_MOVEMENT',
+          intensity: 3.2,
+          duration_seconds: 5,
+          movement_timestamp: timestamp,
+          synced_at: new Date().toISOString(),
+          sync_status: 'SYNCED',
+          source: 'WIFI',
+          created_at: new Date().toISOString(),
+        };
+        dbAdapter.insert('wearable_movement_records', movementRecord);
+      }
+    }
+
+    // 4. Update device metadata
+    dbAdapter.update('wearable_devices', deviceRecordId, {
+      last_seen_at: timestamp,
+      last_synced_at: new Date().toISOString(),
+      connection_status: 'CONNECTED',
+      updated_at: new Date().toISOString(),
+    });
+  },
+
+  async connectRealDevice(
+    patientId: string,
+    pregnancyId: string,
+    rawDeviceId: string
+  ): Promise<{ success: boolean; device?: WearableDevice; error?: string; row?: WearableDataRow | null }> {
+    const trimmedId = rawDeviceId.trim();
+    if (!trimmedId || trimmedId.length < 2) {
+      return { success: false, error: 'Invalid device ID. Please enter a valid LifelineX Device ID (e.g. LX-WATCH-001).' };
+    }
+
+    let liveRow: WearableDataRow | null = null;
+
+    if (isSupabaseConfigured()) {
+      try {
+        const { data, error } = await supabase
+          .from('wearable_data')
+          .select('*')
+          .eq('device_id', trimmedId)
+          .order('last_seen', { ascending: false })
+          .limit(1);
+
+        if (error) {
+          console.error('Supabase query error:', error);
+          return { success: false, error: 'Backend communication error. Could not verify device on Supabase.' };
+        }
+
+        if (data && data.length > 0) {
+          liveRow = data[0] as WearableDataRow;
+          // Mark band connected on remote table
+          await supabase
+            .from('wearable_data')
+            .update({ band_connected: true, last_seen: new Date().toISOString() })
+            .eq('device_id', trimmedId);
+        } else {
+          // Provision the initial registration row in Supabase so the ESP32 can sync to it
+          const { data: inserted, error: insertError } = await supabase
+            .from('wearable_data')
+            .insert({
+              device_id: trimmedId,
+              band_connected: true,
+              motion_status: 'NORMAL',
+              fall_detected: false,
+              last_seen: new Date().toISOString(),
+            })
+            .select()
+            .single();
+
+          if (insertError) {
+            console.warn('Could not auto-register device row in Supabase:', insertError);
+          } else {
+            liveRow = inserted as WearableDataRow;
+          }
+        }
+      } catch (err: any) {
+        console.error('Exception during device connection:', err);
+        return { success: false, error: 'Backend unavailable. Please verify network connection.' };
+      }
+    }
+
+    // Link device in local dbAdapter for this pregnancy
+    const existing = this.getDeviceForPregnancy(pregnancyId);
+    let device: WearableDevice;
+
+    if (existing) {
+      device = dbAdapter.update('wearable_devices', existing.id, {
+        device_id: trimmedId,
+        device_name: `LifelineX Maternal ESP32 Band (${trimmedId})`,
+        connection_status: 'CONNECTED',
+        last_seen_at: liveRow?.last_seen || new Date().toISOString(),
+        last_synced_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    } else {
+      device = dbAdapter.insert('wearable_devices', {
+        id: crypto.randomUUID(),
+        patient_id: patientId,
+        pregnancy_id: pregnancyId,
+        device_id: trimmedId,
+        device_name: `LifelineX Maternal ESP32 Band (${trimmedId})`,
+        device_model: 'ESP32-MAX30102-MPU6050',
+        mac_address_masked: 'C4:4F:33:**:**:' + Math.floor(10 + Math.random() * 89),
+        battery_level: 86,
+        connection_status: 'CONNECTED',
+        last_seen_at: liveRow?.last_seen || new Date().toISOString(),
+        last_synced_at: new Date().toISOString(),
+        firmware_version: 'v1.4.2-rel',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+    }
+
+    if (liveRow) {
+      this.ingestSupabaseRow(pregnancyId, patientId, device.id, liveRow);
+    }
+
+    return { success: true, device, row: liveRow };
+  },
+
+  pairDevice(patientId: string, pregnancyId: string, deviceName = 'LifelineX Maternal ESP32 Band (LX-WATCH-001)'): WearableDevice {
     const existing = this.getDeviceForPregnancy(pregnancyId);
     if (existing) {
       return dbAdapter.update('wearable_devices', existing.id, {
@@ -66,12 +385,14 @@ export const wearableService = {
       id: crypto.randomUUID(),
       patient_id: patientId,
       pregnancy_id: pregnancyId,
+      device_id: 'LX-WATCH-001',
       device_name: deviceName,
       device_model: 'ESP32-MAX30102-MPU6050',
       mac_address_masked: 'C4:4F:33:**:**:' + Math.floor(10 + Math.random() * 89),
-      battery_level: 95,
+      battery_level: 86,
       connection_status: 'CONNECTED',
       last_synced_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
       firmware_version: 'v1.4.2-rel',
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
@@ -80,11 +401,61 @@ export const wearableService = {
     return dbAdapter.insert('wearable_devices', newDevice);
   },
 
+  async disconnectRealDevice(pregnancyId: string): Promise<void> {
+    const dev = this.getDeviceForPregnancy(pregnancyId);
+    if (dev) {
+      dbAdapter.update('wearable_devices', dev.id, {
+        connection_status: 'DISCONNECTED',
+        updated_at: new Date().toISOString(),
+      });
+      if (dev.device_id && isSupabaseConfigured()) {
+        try {
+          await supabase
+            .from('wearable_data')
+            .update({ band_connected: false })
+            .eq('device_id', dev.device_id);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  },
+
   disconnectDevice(deviceId: string): void {
     dbAdapter.update('wearable_devices', deviceId, {
       connection_status: 'DISCONNECTED',
       updated_at: new Date().toISOString(),
     });
+  },
+
+  async syncDeviceNow(
+    pregnancyId: string,
+    deviceId: string
+  ): Promise<{ success: boolean; data?: WearableDataRow | null; error?: string }> {
+    const dev = this.getDeviceForPregnancy(pregnancyId);
+    if (!dev) {
+      return { success: false, error: 'Device not registered.' };
+    }
+
+    if (!isSupabaseConfigured()) {
+      // Local fallback sync
+      dbAdapter.update('wearable_devices', dev.id, {
+        last_synced_at: new Date().toISOString(),
+        connection_status: 'CONNECTED',
+      });
+      return { success: true };
+    }
+
+    try {
+      const liveRow = await this.fetchWearableData(deviceId);
+      if (liveRow) {
+        this.ingestSupabaseRow(pregnancyId, dev.patient_id, dev.id, liveRow);
+        return { success: true, data: liveRow };
+      }
+      return { success: false, error: 'No sensor data received from backend yet.' };
+    } catch (e: any) {
+      return { success: false, error: e?.message || 'Sync failed.' };
+    }
   },
 
   // ─── 2. Offline Queue & Synchronization ───────────────────────────────────

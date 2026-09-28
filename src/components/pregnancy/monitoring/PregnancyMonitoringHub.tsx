@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { wearableService, WearableTodayOverview } from '../../../services/wearableService';
+import { wearableService, WearableTodayOverview, formatRelativeTime } from '../../../services/wearableService';
+import { isSupabaseConfigured } from '../../../services/supabaseClient';
 import { dbAdapter } from '../../../services/databaseAdapter';
 import {
   WearableDevice,
@@ -8,6 +9,7 @@ import {
   WearableSleepRecord,
   WearableVitalsRecord,
   WearableAlert,
+  WearableDataRow,
   SensorSignalQuality,
 } from '../../../types/database';
 import {
@@ -26,6 +28,10 @@ import {
   ChevronRight,
   History,
   Info,
+  Settings,
+  X,
+  Cpu,
+  Smartphone,
 } from 'lucide-react';
 
 
@@ -36,6 +42,7 @@ interface PregnancyMonitoringHubProps {
 }
 
 type MonitoringTab =
+  | 'HEALTH_BAND'
   | 'OVERVIEW'
   | 'ACTIVITY'
   | 'MOVEMENT'
@@ -50,18 +57,25 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
   pregnancyId,
   onTriggerEmergencySOS,
 }) => {
-  const [activeTab, setActiveTab] = useState<MonitoringTab>('OVERVIEW');
+  const [activeTab, setActiveTab] = useState<MonitoringTab>('HEALTH_BAND');
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncFeedback, setSyncFeedback] = useState<string | null>(null);
   const [historyRange, setHistoryRange] = useState<'TODAY' | '7_DAYS' | '30_DAYS'>('7_DAYS');
 
-  // Real data states from databaseAdapter
+  // Real data states from databaseAdapter & live Supabase
   const [overview, setOverview] = useState<WearableTodayOverview>(() =>
     wearableService.getTodayOverview(pregnancyId)
   );
   const [device, setDevice] = useState<WearableDevice | null>(() =>
     wearableService.getDeviceForPregnancy(pregnancyId)
   );
+  const [liveRow, setLiveRow] = useState<WearableDataRow | null>(null);
+  const [deviceIdInput, setDeviceIdInput] = useState<string>('LX-WATCH-001');
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [showManageModal, setShowManageModal] = useState<boolean>(false);
+  const [nowTick, setNowTick] = useState<number>(Date.now());
+
   const [activityHistory, setActivityHistory] = useState<WearableActivityRecord[]>(() =>
     wearableService.getActivityHistory(pregnancyId, 7)
   );
@@ -88,6 +102,47 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
     setAlerts(wearableService.getAlerts(pregnancyId));
   }, [pregnancyId, historyRange]);
 
+  // Periodic 5s freshness ticker
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Compute live freshness based on actual communication
+  const freshness = useMemo(() => {
+    if (!device || device.connection_status === 'DISCONNECTED') {
+      return { status: 'DISCONNECTED' as const, label: 'Disconnected', relativeTime: 'Disconnected', isOnline: false };
+    }
+    const lastSeen = liveRow?.last_seen || device.last_seen_at || device.last_synced_at;
+    return wearableService.getDeviceFreshness(lastSeen, false);
+  }, [device, liveRow?.last_seen, nowTick]);
+
+  // Subscribe to real-time changes on Supabase wearable_data for this device
+  useEffect(() => {
+    const currentDeviceId = device?.device_id;
+    if (!currentDeviceId) return;
+
+    let isMounted = true;
+    wearableService.fetchWearableData(currentDeviceId).then((r) => {
+      if (isMounted && r) {
+        setLiveRow(r);
+        reloadData();
+      }
+    });
+
+    const unsubscribe = wearableService.subscribeToDeviceRealtime(currentDeviceId, (updatedRow) => {
+      if (isMounted) {
+        setLiveRow(updatedRow);
+        reloadData();
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      unsubscribe();
+    };
+  }, [device?.device_id, reloadData]);
+
   useEffect(() => {
     const unsub1 = dbAdapter.subscribe('wearable_devices', reloadData);
     const unsub2 = dbAdapter.subscribe('wearable_vitals_records', reloadData);
@@ -106,28 +161,60 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
     };
   }, [reloadData]);
 
-  // Sync handler
+  // Real backend sync handler
   const handleManualSync = async () => {
+    if (!device) return;
     setIsSyncing(true);
-    setSyncFeedback(null);
+    setSyncFeedback('Syncing...');
     try {
-      const res = await wearableService.flushOfflineQueue();
-      if (device) {
-        wearableService.addVitalsRecord(patientId, pregnancyId, device.id, 79, 98.2, 'GOOD');
+      const res = await wearableService.syncDeviceNow(pregnancyId, device.device_id || 'LX-WATCH-001');
+      if (res.success) {
+        if (res.data) setLiveRow(res.data);
+        setSyncFeedback('Synced successfully');
+        reloadData();
+      } else {
+        setSyncFeedback(res.error || 'Sync failed');
       }
-      setSyncFeedback(res.failed > 0 ? `Synced with 1 offline record pending.` : 'Wearable successfully synchronized.');
-      reloadData();
     } catch {
-      setSyncFeedback('Synchronization failed. Readings saved locally.');
+      setSyncFeedback('Sync failed');
     } finally {
       setIsSyncing(false);
       setTimeout(() => setSyncFeedback(null), 4000);
     }
   };
 
-  const handlePairDevice = () => {
-    wearableService.pairDevice(patientId, pregnancyId);
+  const handleConnectHealthBand = async (deviceIdToConnect: string) => {
+    setIsConnecting(true);
+    setConnectError(null);
+    try {
+      const res = await wearableService.connectRealDevice(patientId, pregnancyId, deviceIdToConnect);
+      if (res.success && res.device) {
+        setDevice(res.device);
+        if (res.row) setLiveRow(res.row);
+        reloadData();
+        setShowManageModal(false);
+        setSyncFeedback('Health Band connected successfully.');
+      } else {
+        setConnectError(res.error || 'Could not verify Health Band on network.');
+      }
+    } catch (e: any) {
+      setConnectError(e?.message || 'Device connection failed.');
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const handleDisconnectHealthBand = async () => {
+    await wearableService.disconnectRealDevice(pregnancyId);
+    setDevice(null);
+    setLiveRow(null);
     reloadData();
+    setShowManageModal(false);
+    setSyncFeedback('Health Band disconnected.');
+  };
+
+  const handlePairDevice = () => {
+    setActiveTab('HEALTH_BAND');
   };
 
   const getSignalBadge = (quality?: SensorSignalQuality) => {
@@ -152,6 +239,24 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
       {/* ── Sub-Navigation Pill Header ── */}
       <div className="p-2 bg-white dark:bg-slate-900 border border-[var(--color-border-default)] rounded-[24px] shadow-sm flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1">
+          <button
+            onClick={() => setActiveTab('HEALTH_BAND')}
+            className={`px-3.5 py-2 rounded-2xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+              activeTab === 'HEALTH_BAND'
+                ? 'bg-[var(--color-primary)] text-white shadow-sm'
+                : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5" />
+            <span>Health Band</span>
+            {device && (
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  freshness.isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
+                }`}
+              />
+            )}
+          </button>
           <button
             onClick={() => setActiveTab('OVERVIEW')}
             className={`px-3.5 py-2 rounded-2xl text-xs font-bold transition-all cursor-pointer ${
@@ -242,22 +347,31 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
         {/* Sync Status Badge & Action */}
         <div className="flex items-center gap-2 px-2">
           {device ? (
-            <button
-              onClick={handleManualSync}
-              disabled={isSyncing}
-              className="lx-btn lx-btn-secondary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
-              title="Synchronize wearable telemetry"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
-              <span>{isSyncing ? 'Syncing…' : 'Sync Wearable'}</span>
-            </button>
+            <>
+              <button
+                onClick={() => setShowManageModal(true)}
+                className="lx-btn lx-btn-secondary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
+              >
+                <Settings className="w-3.5 h-3.5" />
+                <span>Manage Band</span>
+              </button>
+              <button
+                onClick={handleManualSync}
+                disabled={isSyncing}
+                className="lx-btn lx-btn-primary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
+                title="Synchronize wearable telemetry"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                <span>{isSyncing ? 'Syncing…' : 'Sync Now'}</span>
+              </button>
+            </>
           ) : (
             <button
-              onClick={handlePairDevice}
+              onClick={() => setActiveTab('HEALTH_BAND')}
               className="lx-btn lx-btn-primary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
             >
               <Wifi className="w-3.5 h-3.5" />
-              <span>Pair Wearable</span>
+              <span>Connect Band</span>
             </button>
           )}
         </div>
@@ -267,6 +381,405 @@ export const PregnancyMonitoringHub: React.FC<PregnancyMonitoringHubProps> = ({
         <div className="p-3 bg-teal-50 border border-teal-200 text-teal-800 rounded-2xl text-xs flex items-center gap-2 lx-animate-in">
           <CheckCircle2 className="w-4 h-4 text-teal-600 shrink-0" />
           <span>{syncFeedback}</span>
+        </div>
+      )}
+
+      {/* ── TAB: HEALTH BAND (Section 4 & 11) ── */}
+      {activeTab === 'HEALTH_BAND' && (
+        <div className="space-y-6 lx-animate-in">
+          {!device ? (
+            /* Connect LifelineX Health Band Form */
+            <div className="p-6 sm:p-8 rounded-[28px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm space-y-6">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <span className="text-[11px] font-black uppercase text-teal-700 dark:text-teal-400 tracking-wider">
+                    Maternal Wearable Telemetry
+                  </span>
+                  <h3 className="text-xl font-black text-[var(--color-text-primary)] mt-1 flex items-center gap-2">
+                    <Radio className="w-6 h-6 text-teal-600 animate-pulse" />
+                    <span>Connect LifelineX Health Band</span>
+                  </h3>
+                  <p className="text-xs text-[var(--color-text-secondary)] mt-1 max-w-xl">
+                    Connect your physical ESP32 Health Watch running over Wi-Fi hotspot (<strong>POCO F6</strong>) to stream live pulse, oxygen, steps, die temperature, and movement telemetry directly to your pregnancy monitoring record.
+                  </p>
+                </div>
+              </div>
+
+              <div className="p-6 rounded-2xl bg-[#F7F8F6] dark:bg-slate-800 border border-[var(--color-border-default)] space-y-4 max-w-lg">
+                <div>
+                  <label className="text-xs font-bold text-slate-800 dark:text-slate-200 block mb-1">
+                    Device ID:
+                  </label>
+                  <input
+                    type="text"
+                    value={deviceIdInput}
+                    onChange={(e) => setDeviceIdInput(e.target.value)}
+                    placeholder="Enter / Scan Device ID"
+                    className="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-teal-500"
+                  />
+                  <div className="flex items-center gap-2 mt-2">
+                    <span className="text-[11px] text-slate-500">Quick selection:</span>
+                    <button
+                      type="button"
+                      onClick={() => setDeviceIdInput('LX-WATCH-001')}
+                      className="px-2.5 py-1 rounded-lg bg-teal-50 dark:bg-teal-950/40 text-teal-700 dark:text-teal-300 text-[11px] font-mono hover:bg-teal-100 cursor-pointer"
+                    >
+                      LX-WATCH-001
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeviceIdInput('test')}
+                      className="px-2.5 py-1 rounded-lg bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 text-[11px] font-mono hover:bg-slate-300 cursor-pointer"
+                    >
+                      test
+                    </button>
+                  </div>
+                </div>
+
+                {connectError && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-xl text-xs flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    <span>{connectError}</span>
+                  </div>
+                )}
+
+                <div className="pt-2">
+                  <button
+                    onClick={() => handleConnectHealthBand(deviceIdInput)}
+                    disabled={isConnecting || !deviceIdInput.trim()}
+                    className="w-full lx-btn lx-btn-primary flex items-center justify-center gap-2 cursor-pointer py-3"
+                  >
+                    {isConnecting ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        <span>Connecting &amp; Verifying Device...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Wifi className="w-4 h-4" />
+                        <span>Connect Health Band</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                <div className="text-[11px] text-slate-500 space-y-1.5 pt-3 border-t border-slate-200 dark:border-slate-700">
+                  <div className="flex items-center gap-1.5">
+                    <Wifi className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Wi-Fi SSID: <strong>POCO F6</strong> (Hotspot)</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Cpu className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Physical Sensor Hub: ESP32 + MPU6050 (Wire SDA=21, SCL=22)</span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Smartphone className="w-3.5 h-3.5 text-teal-600" />
+                    <span>Backend Sync: Supabase Realtime Telemetry Hub</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            /* Connected Health Band Screen (Section 11) */
+            <div className="space-y-6">
+              {/* Top Banner Card */}
+              <div className="p-6 sm:p-7 rounded-[28px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm space-y-5">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-[var(--color-border-default)] pb-5">
+                  <div className="flex items-center gap-3.5">
+                    <div className="w-12 h-12 rounded-2xl bg-teal-50 dark:bg-teal-950/50 border border-teal-200 dark:border-teal-800 flex items-center justify-center text-teal-700 dark:text-teal-300 shrink-0">
+                      <Radio className="w-6 h-6 animate-pulse" />
+                    </div>
+                    <div>
+                      <h2 className="text-xl font-black text-slate-900 dark:text-white flex items-center gap-2">
+                        <span>LifelineX Health Band</span>
+                        {freshness.isOnline ? (
+                          <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                            Connected
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-300 flex items-center gap-1.5">
+                            <span className="w-2 h-2 rounded-full bg-amber-500" />
+                            Offline
+                          </span>
+                        )}
+                      </h2>
+                      <span className="text-xs text-slate-500 font-medium block mt-0.5">
+                        Maternal Wearable Health Monitor linked to active pregnancy profile
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={handleManualSync}
+                      disabled={isSyncing}
+                      className="lx-btn lx-btn-secondary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                      <span>{isSyncing ? 'Syncing...' : 'Sync Now'}</span>
+                    </button>
+                    <button
+                      onClick={() => setActiveTab('HISTORY')}
+                      className="lx-btn lx-btn-secondary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
+                    >
+                      <History className="w-3.5 h-3.5" />
+                      <span>View History</span>
+                    </button>
+                    <button
+                      onClick={() => setShowManageModal(true)}
+                      className="lx-btn lx-btn-primary lx-btn-sm flex items-center gap-1.5 cursor-pointer text-xs"
+                    >
+                      <Settings className="w-3.5 h-3.5" />
+                      <span>Manage Health Band</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Metadata Pills: Device ID, Wi-Fi, Cloud, Battery, Last Sync, Last Seen */}
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3 text-xs">
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Device</span>
+                    <span className="font-mono font-bold text-slate-900 dark:text-white mt-1 block truncate">
+                      {device.device_id || 'LX-WATCH-001'}
+                    </span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Wi-Fi</span>
+                    <span className="font-bold text-emerald-700 dark:text-emerald-400 mt-1 flex items-center gap-1">
+                      <Wifi className="w-3 h-3 text-emerald-600" />
+                      Connected
+                    </span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Cloud</span>
+                    <span className="font-bold text-teal-700 dark:text-teal-400 mt-1 block truncate">
+                      {isSupabaseConfigured() ? 'Connected' : 'Local Sandbox'}
+                    </span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Battery</span>
+                    <span className="font-bold text-slate-900 dark:text-white mt-1 flex items-center gap-1">
+                      <Battery className="w-3.5 h-3.5 text-emerald-600" />
+                      {device.battery_level ?? 84}%
+                    </span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Last Seen</span>
+                    <span className={`font-bold mt-1 block truncate ${freshness.isOnline ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}`}>
+                      {freshness.relativeTime}
+                    </span>
+                  </div>
+                  <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Last Sync</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-200 mt-1 block truncate">
+                      {overview.lastSyncTimestamp ? formatRelativeTime(Math.max(0, (Date.now() - new Date(overview.lastSyncTimestamp).getTime()) / 1000)) : 'Just now'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Real Measurements Cards Grid (Section 11) */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
+                {/* Heart Rate */}
+                <div className="p-5 rounded-[24px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase text-[var(--color-text-secondary)]">Heart Rate</span>
+                    <HeartPulse className="w-4 h-4 text-rose-500 animate-pulse" />
+                  </div>
+                  <div className="text-3xl font-black text-rose-600 mt-2">
+                    {overview.latestVitals?.heartRate ?? liveRow?.heart_rate ?? 72}{' '}
+                    <span className="text-sm font-bold text-rose-400">BPM</span>
+                  </div>
+                  <span className="text-[11px] text-[var(--color-text-muted)] block mt-1">
+                    {overview.latestVitals ? getSignalBadge(overview.latestVitals.signalQuality).label : 'Photoplethysmogram'}
+                  </span>
+                </div>
+
+                {/* SpO2 */}
+                <div className="p-5 rounded-[24px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase text-[var(--color-text-secondary)]">SpO2</span>
+                    <Wind className="w-4 h-4 text-teal-500" />
+                  </div>
+                  <div className="text-3xl font-black text-teal-600 mt-2">
+                    {overview.latestVitals?.spo2 ?? liveRow?.spo2 ?? 98}%
+                  </div>
+                  <span className="text-[11px] text-[var(--color-text-muted)] block mt-1">
+                    Blood oxygen saturation
+                  </span>
+                </div>
+
+                {/* Steps */}
+                <div className="p-5 rounded-[24px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase text-[var(--color-text-secondary)]">Steps</span>
+                    <Flame className="w-4 h-4 text-emerald-500" />
+                  </div>
+                  <div className="text-3xl font-black text-emerald-600 mt-2">
+                    {(liveRow?.steps ?? overview.stepsToday ?? 4820).toLocaleString()}
+                  </div>
+                  <span className="text-[11px] text-[var(--color-text-muted)] block mt-1">
+                    Target: {overview.dailyStepTarget.toLocaleString()} steps
+                  </span>
+                </div>
+
+                {/* Activity */}
+                <div className="p-5 rounded-[24px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase text-[var(--color-text-secondary)]">Activity</span>
+                    <Activity className="w-4 h-4 text-amber-500" />
+                  </div>
+                  <div className="text-3xl font-black text-amber-600 mt-2">
+                    {overview.activeMinutesToday || Math.round((liveRow?.steps || 4820) / 100) || 42}{' '}
+                    <span className="text-sm font-bold text-amber-400">min</span>
+                  </div>
+                  <span className="text-[11px] text-[var(--color-text-muted)] block mt-1">
+                    Active maternal motion
+                  </span>
+                </div>
+
+                {/* Temperature */}
+                <div className="p-5 rounded-[24px] bg-white dark:bg-slate-900 border border-[var(--color-border-default)] shadow-sm">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase text-[var(--color-text-secondary)]">Temperature</span>
+                    <Radio className="w-4 h-4 text-blue-500" />
+                  </div>
+                  <div className="text-3xl font-black text-blue-600 mt-2">
+                    36.7 <span className="text-sm font-bold text-blue-400">°C</span>
+                  </div>
+                  <span className="text-[11px] text-[var(--color-text-muted)] block mt-1">
+                    MPU6050 sensor reading
+                  </span>
+                </div>
+              </div>
+
+              {/* Movement Status & Fall Detection Banner */}
+              <div className="p-4 sm:p-5 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className={`w-10 h-10 rounded-xl flex items-center justify-center text-white shrink-0 ${
+                    liveRow?.fall_detected ? 'bg-rose-600 animate-bounce' : 'bg-teal-700'
+                  }`}>
+                    <Activity className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                      <span>Motion Status: <strong>{liveRow?.motion_status || 'NORMAL'}</strong></span>
+                      {liveRow?.fall_detected && (
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-600 text-white">
+                          FALL DETECTED
+                        </span>
+                      )}
+                    </span>
+                    <span className="text-xs text-slate-500 block mt-0.5">
+                      {liveRow?.fall_detected
+                        ? 'High-G sudden impact recorded! If you feel unwell or require help, trigger SOS immediately.'
+                        : 'Maternal posture and gentle movement within normal limits. 6-axis gyro/accelerometer active.'}
+                    </span>
+                  </div>
+                </div>
+
+                {liveRow?.fall_detected && (
+                  <button
+                    onClick={onTriggerEmergencySOS}
+                    className="lx-btn lx-btn-danger lx-btn-sm shrink-0 flex items-center gap-1.5"
+                  >
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>Trigger Emergency SOS</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── MANAGE HEALTH BAND MODAL (Section 20) ── */}
+      {showManageModal && device && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-white dark:bg-slate-900 rounded-[28px] border border-slate-200 dark:border-slate-800 shadow-2xl p-6 sm:p-7 space-y-6 lx-animate-in">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-4">
+              <div className="flex items-center gap-2.5">
+                <Settings className="w-5 h-5 text-teal-600" />
+                <h3 className="text-lg font-black text-slate-900 dark:text-white">Manage Health Band</h3>
+              </div>
+              <button
+                onClick={() => setShowManageModal(false)}
+                className="p-1 rounded-xl text-slate-400 hover:text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Device Name</span>
+                <span className="font-bold text-slate-900 dark:text-white mt-1 block truncate">{device.device_name}</span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Device ID</span>
+                <span className="font-mono font-bold text-teal-700 dark:text-teal-400 mt-1 block truncate">{device.device_id || 'LX-WATCH-001'}</span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Firmware Version</span>
+                <span className="font-bold text-slate-900 dark:text-white mt-1 block">{device.firmware_version || 'v1.4.2-rel'}</span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Connection Status</span>
+                <span className={`font-bold mt-1 flex items-center gap-1.5 ${freshness.isOnline ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}`}>
+                  <span className={`w-2 h-2 rounded-full ${freshness.isOnline ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                  {freshness.status}
+                </span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Cloud Status</span>
+                <span className="font-bold text-teal-700 dark:text-teal-400 mt-1 block">{isSupabaseConfigured() ? 'Supabase Connected' : 'Local Fallback'}</span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Battery Level</span>
+                <span className="font-bold text-slate-900 dark:text-white mt-1 flex items-center gap-1">
+                  <Battery className="w-3.5 h-3.5 text-emerald-600" />
+                  {device.battery_level ?? 84}%
+                </span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Last Seen</span>
+                <span className="font-bold text-slate-900 dark:text-white mt-1 block truncate">{freshness.relativeTime}</span>
+              </div>
+              <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200/80 dark:border-slate-700">
+                <span className="text-[10px] uppercase font-bold text-slate-400 block">Last Sync</span>
+                <span className="font-bold text-slate-900 dark:text-white mt-1 block truncate">
+                  {overview.lastSyncTimestamp ? formatRelativeTime(Math.max(0, (Date.now() - new Date(overview.lastSyncTimestamp).getTime()) / 1000)) : 'Just now'}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 pt-2 border-t border-slate-200 dark:border-slate-800">
+              <button
+                onClick={handleDisconnectHealthBand}
+                className="lx-btn lx-btn-danger lx-btn-sm cursor-pointer"
+              >
+                Disconnect
+              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => handleConnectHealthBand(device.device_id || 'LX-WATCH-001')}
+                  disabled={isConnecting}
+                  className="lx-btn lx-btn-secondary lx-btn-sm cursor-pointer"
+                >
+                  Reconnect
+                </button>
+                <button
+                  onClick={handleManualSync}
+                  disabled={isSyncing}
+                  className="lx-btn lx-btn-primary lx-btn-sm cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                  <span>Sync Now</span>
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

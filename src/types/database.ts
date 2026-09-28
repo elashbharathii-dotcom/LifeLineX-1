@@ -465,7 +465,19 @@ export interface Guardian {
 }
 
 // ─── Pregnancy-Only Wearable Monitoring System Types ─────────────────────────
-export type WearableConnectionStatus = 'CONNECTED' | 'DISCONNECTED' | 'PAIRING';
+export type WearableConnectionStatus =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'SYNCING'
+  | 'SYNCED'
+  | 'OFFLINE'
+  | 'WAITING_TO_SYNC'
+  | 'SYNC_FAILED'
+  | 'DEVICE_UNAUTHORIZED'
+  | 'BACKEND_UNAVAILABLE'
+  | 'INVALID_DEVICE'
+  | 'PAIRING';
 export type WearableSyncStatus = 'LOCAL_ONLY' | 'PENDING_SYNC' | 'SYNCED' | 'SYNC_FAILED';
 export type SensorSignalQuality = 'GOOD' | 'FAIR' | 'POOR' | 'INVALID';
 export type WearableActivityLevel = 'INACTIVE' | 'LIGHT' | 'MODERATE' | 'VIGOROUS';
@@ -481,16 +493,31 @@ export type WearableAlertType =
 export type WearableAlertSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
 export type WearableAlertStatus = 'ACTIVE' | 'ACKNOWLEDGED' | 'RESOLVED';
 
+export interface WearableDataRow {
+  id: number;
+  device_id: string;
+  band_connected: boolean;
+  heart_rate: number | null;
+  spo2: number | null;
+  steps: number | null;
+  motion_status: string | null;
+  fall_detected: boolean | null;
+  last_seen: string | null;
+  created_at: string;
+}
+
 export interface WearableDevice {
   id: string;
   patient_id: string;
   pregnancy_id: string;
+  device_id?: string;
   device_name: string;
   device_model: string;
   mac_address_masked: string;
   battery_level?: number;
   connection_status: WearableConnectionStatus;
   last_synced_at?: string;
+  last_seen_at?: string;
   firmware_version?: string;
   created_at: string;
   updated_at: string;
